@@ -96,39 +96,12 @@ def execute_shell_command(
     if env:
         process_env.update(env)
 
-    # Create a process that redirects output to pipes so we can capture it
+    # Launch process with inherited stdout/stderr so server logs appear in caller output
     process = subprocess.Popen(
         command,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1,  # Line buffered
         env=process_env,  # Pass the environment variables
     )
-
-    # Set up background thread to read and log stdout
-    def log_output() -> None:
-        if process.stdout is None:
-            return
-        for line in iter(process.stdout.readline, ""):
-            if line:
-                logger.debug(line.strip())
-        process.stdout.close()
-
-    # Set up background thread to read and log stderr
-    def log_error() -> None:
-        if process.stderr is None:
-            return
-        for line in iter(process.stderr.readline, ""):
-            if line:
-                logger.info(line.strip())
-        process.stderr.close()
-
-    # Start background threads to handle output
-    import threading
-
-    threading.Thread(target=log_output, daemon=True).start()
-    threading.Thread(target=log_error, daemon=True).start()
 
     logger.info(f"Started server with command: {' '.join(command)}")
     return process
