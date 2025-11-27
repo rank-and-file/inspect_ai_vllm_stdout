@@ -117,7 +117,7 @@ class VLLMAPI(OpenAICompatibleAPI):
         if not self.server_found:
             if preq_err:
                 logger.warning(
-                    f"vLLM server config has missing prerequisites {preq_err}. Starting new server for {model_name}."
+                    f"Starting new server for {model_name}."
                 )
             else:
                 logger.warning(
@@ -189,6 +189,7 @@ class VLLMAPI(OpenAICompatibleAPI):
             timeout=timeout,
             server_args=self.server_args,
             env=env_vars,
+            stream_output=False,
         )
 
         # Register cleanup function to run when Python exits

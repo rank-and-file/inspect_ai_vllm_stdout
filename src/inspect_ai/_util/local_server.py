@@ -5,7 +5,9 @@ import platform
 import random
 import socket
 import subprocess
+import threading
 import time
+from collections import deque
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
@@ -15,9 +17,62 @@ logger = logging.getLogger(__name__)
 
 # Global dictionary to keep track of process -> reserved port mappings
 process_socket_map: dict[subprocess.Popen[str], socket.socket] = {}
+process_log_buffers: dict[
+    subprocess.Popen[str], tuple[deque[str], threading.Lock]
+] = {}
+process_log_threads: dict[subprocess.Popen[str], threading.Thread] = {}
 
 
 DEFAULT_TIMEOUT = 60 * 10  # fairly conservative default timeout of 10 minutes
+SERVER_LOG_BUFFER_LINES = 500
+
+
+def _start_process_output_capture(process: subprocess.Popen[str]) -> None:
+    if process.stdout is None:
+        return
+
+    buffer: deque[str] = deque(maxlen=SERVER_LOG_BUFFER_LINES)
+    lock = threading.Lock()
+    process_log_buffers[process] = (buffer, lock)
+
+    def reader() -> None:
+        assert process.stdout is not None
+        for line in iter(process.stdout.readline, ""):
+            with lock:
+                buffer.append(line.rstrip("\n"))
+        process.stdout.close()
+
+    thread = threading.Thread(target=reader, daemon=True)
+    process_log_threads[process] = thread
+    thread.start()
+
+
+def _captured_process_output(process: subprocess.Popen[str]) -> str | None:
+    entry = process_log_buffers.get(process)
+    if not entry:
+        return None
+
+    buffer, lock = entry
+    with lock:
+        if not buffer:
+            return None
+        return "\n".join(buffer)
+
+
+def _cleanup_process_output(process: subprocess.Popen[str]) -> None:
+    thread = process_log_threads.pop(process, None)
+    if thread:
+        thread.join(timeout=0.1)
+    process_log_buffers.pop(process, None)
+
+
+def _append_captured_output(
+    message: str, process: subprocess.Popen[str]
+) -> str:
+    output = _captured_process_output(process)
+    if not output:
+        return message
+    return f"{message}\n\nCaptured server output:\n{output}"
 
 
 def reserve_port(
@@ -79,7 +134,9 @@ def release_port(lock_socket: socket.socket) -> None:
 
 
 def execute_shell_command(
-    command: list[str], env: Optional[dict[str, str]] = None
+    command: list[str],
+    env: Optional[dict[str, str]] = None,
+    stream_output: bool = True,
 ) -> subprocess.Popen[str]:
     """
     Execute a command and return its process handle.
@@ -87,6 +144,7 @@ def execute_shell_command(
     Args:
         command: List of command arguments
         env: Optional environment variables to pass to the subprocess
+        stream_output: Whether to stream stdout/stderr directly to the caller
 
     Returns:
         A subprocess.Popen object representing the running process
@@ -96,12 +154,23 @@ def execute_shell_command(
     if env:
         process_env.update(env)
 
-    # Launch process with inherited stdout/stderr so server logs appear in caller output
+    stdout = None
+    stderr = None
+    if not stream_output:
+        stdout = subprocess.PIPE
+        stderr = subprocess.STDOUT
+
     process = subprocess.Popen(
         command,
         text=True,
         env=process_env,  # Pass the environment variables
+        stdout=stdout,
+        stderr=stderr,
+        bufsize=1,
     )
+
+    if not stream_output:
+        _start_process_output_capture(process)
 
     logger.info(f"Started server with command: {' '.join(command)}")
     return process
@@ -136,6 +205,7 @@ def launch_server_cmd(
     host: str = "0.0.0.0",
     port: Optional[int] = None,
     env: Optional[dict[str, str]] = None,
+    stream_output: bool = True,
 ) -> Tuple[subprocess.Popen[str], int, list[str]]:
     """
     Launch a server process with the given base command and return the process, port, and full command.
@@ -145,6 +215,7 @@ def launch_server_cmd(
         host: Host to bind to
         port: Port to bind to. If None, a free port is reserved.
         env: Optional environment variables to pass to the subprocess
+        stream_output: Whether to stream stdout/stderr directly to the caller
 
     Returns:
         Tuple of (process, port, full_command)
@@ -157,7 +228,9 @@ def launch_server_cmd(
     full_command = command + ["--port", str(port)]
     logger.info(f"Launching server on port {port}")
 
-    process = execute_shell_command(full_command, env=env)
+    process = execute_shell_command(
+        full_command, env=env, stream_output=stream_output
+    )
 
     if lock_socket is not None:
         process_socket_map[process] = lock_socket
@@ -177,6 +250,8 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
     lock_socket = process_socket_map.pop(process, None)
     if lock_socket is not None:
         release_port(lock_socket)
+
+    _cleanup_process_output(process)
 
 
 def wait_for_server(
@@ -210,14 +285,20 @@ def wait_for_server(
     while True:
         # Check for timeout first
         if timeout and time.time() - start_time > timeout:
-            error_msg = f"Server did not become ready within timeout period ({timeout} seconds). Try increasing the timeout with '-M timeout=...'. {debug_advice}"
+            error_msg = _append_captured_output(
+                f"Server did not become ready within timeout period ({timeout} seconds). Try increasing the timeout with '-M timeout=...'. {debug_advice}",
+                process,
+            )
             logger.error(error_msg)
             raise TimeoutError(error_msg)
 
         # Check if the process is still alive
         if process.poll() is not None:
             exit_code = process.poll()
-            error_msg = f"Server process exited unexpectedly with code {exit_code}. {debug_advice}"
+            error_msg = _append_captured_output(
+                f"Server process exited unexpectedly with code {exit_code}. {debug_advice}",
+                process,
+            )
             logger.error(error_msg)
             raise RuntimeError(error_msg)
 
@@ -253,6 +334,7 @@ def start_local_server(
     timeout: Optional[int] = DEFAULT_TIMEOUT,
     server_args: Optional[dict[str, Any]] = None,
     env: Optional[dict[str, str]] = None,
+    stream_output: bool = True,
 ) -> Tuple[str, subprocess.Popen[str], int]:
     """
     Start a server with the given command and handle potential errors.
@@ -266,6 +348,7 @@ def start_local_server(
         timeout: Maximum time to wait for server to become ready
         server_args: Additional server arguments to pass to the command
         env: Optional environment variables to pass to the subprocess
+        stream_output: Whether to stream stdout/stderr directly to the caller
     Returns:
         Tuple of (base_url, process, port)
 
@@ -290,7 +373,11 @@ def start_local_server(
 
     try:
         server_process, found_port, full_command = launch_server_cmd(
-            full_command, host=host, port=port, env=process_env
+            full_command,
+            host=host,
+            port=port,
+            env=process_env,
+            stream_output=stream_output,
         )
         base_url = f"http://localhost:{found_port}/v1"
         wait_for_server(
