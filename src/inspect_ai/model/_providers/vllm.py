@@ -189,7 +189,7 @@ class VLLMAPI(OpenAICompatibleAPI):
             timeout=timeout,
             server_args=self.server_args,
             env=env_vars,
-            stream_output=False,
+            stream_output=True,
         )
 
         # Register cleanup function to run when Python exits
